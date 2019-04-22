@@ -6,5 +6,8 @@
     "max_throttled_connections_per_ip": 3,
     "max_message_size": 250000,
     "rate_limit": 250000,
-    "rate_measure_period": 5
+    "dm_rate_limit": 12000,
+    "rate_measure_period": 5,
+    "max_message_ct": 100,
+    "max_dm_ct":      25
 }

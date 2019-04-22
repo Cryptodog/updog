@@ -1,10 +1,10 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"math"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -12,37 +12,6 @@ import (
 
 	"github.com/gorilla/websocket"
 )
-
-type Config struct {
-	ListenAddress     string `json:"listen_address"`
-	WebsocketEndpoint string `json:"websocket_endpoint"`
-
-	// WebSocket URL of XMPP server.
-	UpstreamWebsocketURL string `json:"upstream_websocket_url"`
-
-	// For when we're behind another proxy, such as nginx.
-	UseXForwardedFor bool `json:"use_x_forwarded_for"`
-
-	// How many connections per IP are allowed to max out the rate limit at any given time?
-	MaxThrottledConnectionsPerIP int `json:"max_throttled_connections_per_ip"`
-
-	// The maxiumum allowed size, in bytes, for incoming WebSocket messages from clients.
-	// Offending clients will have their connection terminated.
-	MaxMessageSize int64 `json:"max_message_size"`
-
-	// The maximum allowed rate, in bytes per second (B/s), for incoming traffic from clients.
-	// Does not apply to WebSocket control messages, such as ping and close.
-	RateLimit int `json:"rate_limit"`
-
-	// The period, in seconds, within which traffic rates are calculated.
-	// A value that seems to work well is 5.
-	// TODO: formalize this
-	RateMeasurePeriod int `json:"rate_measure_period"`
-}
-
-const configFile = "config.json"
-
-var config Config
 
 var upgrader = websocket.Upgrader{
 	// We don't care about the origin.
@@ -62,18 +31,18 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	var ip string
 
 	// TODO: verify this works for IPv6
-	if config.UseXForwardedFor {
+	if config().UseXForwardedFor {
 		forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
 		ip = forwarded[len(forwarded)-1]
 	} else {
-		ip = strings.Split(r.RemoteAddr, ":")[0]
+		ip, _, _ = net.SplitHostPort(r.RemoteAddr)
 	}
 
 	header := http.Header{}
 	header.Add("Origin", r.Header.Get("Origin"))
 	header.Add("Sec-WebSocket-Protocol", r.Header.Get("Sec-WebSocket-Protocol"))
 
-	upstream, resp, err := websocket.DefaultDialer.Dial(config.UpstreamWebsocketURL, header)
+	upstream, resp, err := websocket.DefaultDialer.Dial(config().UpstreamWebsocketURL, header)
 	if err != nil {
 		log.Printf("[client: %v] dial upstream: %v", ip, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -92,15 +61,17 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer downstream.Close()
 
-	downstream.SetReadLimit(config.MaxMessageSize)
+	downstream.SetReadLimit(config().MaxMessageSize)
 
 	// XXX: chan buffer set to (# chan writes - 1) to prevent blocked goroutines.
 	errc := make(chan error, 5)
 	done := make(chan bool)
 
 	go func() {
+		dmByteCount := 0
 		byteCount := 0
 		msgCount := 0
+		dmCount := 0
 		var startedCountingAt time.Time
 		measureLock := sync.Mutex{}
 
@@ -109,8 +80,10 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 				select {
 				case <-done:
 					return
-				case <-time.After(time.Duration(config.RateMeasurePeriod) * time.Second):
+				case <-time.After(time.Duration(config().RateMeasurePeriod) * time.Second):
 					measureLock.Lock()
+					dmByteCount = 0
+					dmCount = 0
 					byteCount = 0
 					msgCount = 0
 					startedCountingAt = time.Now()
@@ -129,30 +102,49 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 			if !isControlMessage(mt) {
 				measureLock.Lock()
 				byteCount += len(msg)
+
+				dmSize := dmBytes(string(msg))
+				if dmSize > 0 {
+					dmCount++
+					dmByteCount += dmSize
+				}
+
 				msgCount++
 
 				mc := msgCount
+				dc := dmCount
 				volume := float64(byteCount)
+				dmVolume := float64(dmByteCount)
 				period := time.Since(startedCountingAt)
 				measureLock.Unlock()
 
 				// XXX: magic
-				// TODO: make this a config option
-				if mc > 100 {
+				if mc > config().MaxMessageCt {
 					errc <- fmt.Errorf("sending messages too fast!")
 					break
 				}
 
 				rate := volume / period.Seconds()
+				dmRate := dmVolume / period.Seconds()
 
-				if rate > float64(config.RateLimit) {
+				shouldBeThrottled := (rate > float64(config().RateLimit) || dmRate > float64(config().DMRateLimit) || dc > config().MaxDMCt)
+
+				if shouldBeThrottled {
 					throttledConnectionsPerIPLock.Lock()
 					throttledConnectionsPerIP[ip]++
 					tc := throttledConnectionsPerIP[ip]
 					throttledConnectionsPerIPLock.Unlock()
 
 					// Throttle down to the specified rate limit.
-					time.Sleep(time.Duration((float64(time.Second)*volume)/float64(config.RateLimit)) - period)
+					throttleFor := time.Duration(
+						math.Abs(
+							(float64(time.Second)*volume)/float64(config().RateLimit) - float64(period)))
+
+					if dc > config().MaxDMCt {
+						throttleFor += (time.Duration(dc) * 100 * time.Millisecond)
+					}
+
+					time.Sleep(throttleFor)
 
 					throttledConnectionsPerIPLock.Lock()
 					if throttledConnectionsPerIP[ip] > 0 {
@@ -164,7 +156,7 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 					}
 					throttledConnectionsPerIPLock.Unlock()
 
-					if tc > config.MaxThrottledConnectionsPerIP {
+					if tc > config().MaxThrottledConnectionsPerIP {
 						errc <- fmt.Errorf("too many throttled connections!")
 						break
 					}
@@ -181,6 +173,7 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		byteCount := 0
+
 		var startedCountingAt time.Time
 		measureLock := sync.Mutex{}
 		startDropping := false
@@ -190,11 +183,11 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 				select {
 				case <-done:
 					return
-				case <-time.After(time.Duration(config.RateMeasurePeriod) * time.Second):
+				case <-time.After(time.Duration(config().RateMeasurePeriod) * time.Second):
 					measureLock.Lock()
 
 					// XXX: magic
-					if (float64(byteCount) / time.Since(startedCountingAt).Seconds()) > float64(8*config.RateLimit) {
+					if (float64(byteCount) / time.Since(startedCountingAt).Seconds()) > float64(8*config().RateLimit) {
 						startDropping = true
 					} else {
 						startDropping = false
@@ -222,7 +215,7 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 				// XXX: magic
 				// We're going to lose most (all?) group messages, but this will at least keep the client alive.
 				// Pings, small PMs, public keys, typing notifs, etc. will go through.
-				if startDropping && float64(len(msg)) > (float64(config.RateLimit)/100) {
+				if startDropping && float64(len(msg)) > (float64(config().RateLimit)/100) {
 					continue
 				}
 			}
@@ -252,16 +245,6 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	b, err := ioutil.ReadFile(configFile)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = json.Unmarshal(b, &config)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	http.HandleFunc(config.WebsocketEndpoint, proxy)
-	log.Fatal(http.ListenAndServe(config.ListenAddress, nil))
+	http.HandleFunc(config().WebsocketEndpoint, proxy)
+	log.Fatal(http.ListenAndServe(config().ListenAddress, nil))
 }
