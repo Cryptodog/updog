@@ -1,6 +1,6 @@
-all: cryptodog-proxy
+all: updog
 
-cryptodog-proxy: proxy.go
+updog: proxy.go
 	gofmt -l -s -w .
 	go vet
 	go build
