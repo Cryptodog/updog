@@ -38,6 +38,9 @@ type Config struct {
 	// A value that seems to work well is 5.
 	// TODO: formalize this
 	RateMeasurePeriod int `json:"rate_measure_period"`
+
+	// How often, in seconds, to send pings to downstream client.
+	PingPeriod int `json:"ping_period"`
 }
 
 const configFile = "config.json"
@@ -94,9 +97,14 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 
 	downstream.SetReadLimit(config.MaxMessageSize)
 
-	// XXX: chan buffer set to (# chan writes - 1) to prevent blocked goroutines.
-	errc := make(chan error, 5)
-	done := make(chan bool)
+	pongWait := time.Duration(config.PingPeriod*10/9) * time.Second
+	// The first pong gets some leeway since the first ping won't be sent until about config.PingPeriod from now.
+	downstream.SetReadDeadline(time.Now().Add(pongWait * 2))
+	// This pong handler will be called when downstream is read from, not in a new goroutine.
+	downstream.SetPongHandler(func(string) error { downstream.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+
+	errc := make(chan error, 2)
+	done := make(chan interface{})
 
 	go func() {
 		byteCount := 0
@@ -179,6 +187,32 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Handle writing messages and WebSocket pings to client.
+	type Bytes []byte
+	downWrite := make(chan struct {
+		int
+		Bytes
+	})
+	go func() {
+		ticker := time.NewTicker(time.Duration(config.PingPeriod) * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case pair := <-downWrite:
+				if err := downstream.WriteMessage(pair.int, pair.Bytes); err != nil {
+					errc <- err
+					return
+				}
+			case <-ticker.C:
+				if err := downstream.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+					errc <- err
+					return
+				}
+			}
+		}
+	}()
+
 	go func() {
 		byteCount := 0
 		var startedCountingAt time.Time
@@ -227,10 +261,14 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			err = downstream.WriteMessage(mt, msg)
-			if err != nil {
-				errc <- err
-				break
+			select {
+			case downWrite <- struct {
+				int
+				Bytes
+			}{mt, msg}:
+			case <-done:
+				close(downWrite)
+				return
 			}
 		}
 	}()
@@ -244,11 +282,8 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	throttledConnectionsPerIPLock.Unlock()
 
-	go func() {
-		// Tell our measuring routines to exit.
-		done <- true
-		done <- true
-	}()
+	// Signal remaining routines to clean up.
+	close(done)
 }
 
 func main() {

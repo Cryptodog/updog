@@ -6,5 +6,6 @@
     "max_throttled_connections_per_ip": 3,
     "max_message_size": 250000,
     "rate_limit": 250000,
-    "rate_measure_period": 5
+    "rate_measure_period": 5,
+    "ping_period": 30
 }
