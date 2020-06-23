@@ -90,7 +90,6 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 	downstream, err := upgrader.Upgrade(w, r, header)
 	if err != nil {
 		log.Printf("[client: %v] upgrade: %v", ip, err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer downstream.Close()
