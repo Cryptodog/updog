@@ -1,7 +1,7 @@
 {
-    "listen_address": "127.0.0.1:8008",
-    "websocket_endpoint": "/websocket",
-    "upstream_websocket_url": "ws://ejabberd:5280/websocket",
+    "listen_address": "localhost:8008",
+    "websocket_endpoint": "/ws",
+    "upstream_websocket_url": "ws://cryptodog-server:8009/ws",
     "use_x_forwarded_for": true,
     "max_throttled_connections_per_ip": 3,
     "max_message_size": 250000,
