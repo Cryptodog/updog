@@ -1,5 +1,5 @@
 {
-    "listen_address": "localhost:8008",
+    "listen_address": "0.0.0.0:8008",
     "websocket_endpoint": "/ws",
     "upstream_websocket_url": "ws://cryptodog-server:8009/ws",
     "use_x_forwarded_for": true,
