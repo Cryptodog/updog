@@ -96,7 +96,7 @@ func proxy(w http.ResponseWriter, r *http.Request) {
 
 	downstream.SetReadLimit(config.MaxMessageSize)
 
-	pongWait := time.Duration(config.PingPeriod*10/9) * time.Second
+	pongWait := time.Duration(config.PingPeriod*2) * time.Second
 	// The first pong gets some leeway since the first ping won't be sent until about config.PingPeriod from now.
 	downstream.SetReadDeadline(time.Now().Add(pongWait * 2))
 	// This pong handler will be called when downstream is read from, not in a new goroutine.
